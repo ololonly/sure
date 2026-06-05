@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[7.2].define(version: 2026_05_31_213000) do
+ActiveRecord::Schema[7.2].define(version: 2026_06_05_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pgcrypto"
   enable_extension "plpgsql"
@@ -380,6 +380,43 @@ ActiveRecord::Schema[7.2].define(version: 2026_05_31_213000) do
     t.datetime "updated_at", null: false
     t.index ["family_id", "start_date", "end_date"], name: "index_budgets_on_family_id_and_start_date_and_end_date", unique: true
     t.index ["family_id"], name: "index_budgets_on_family_id"
+  end
+
+  create_table "bybit_accounts", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
+    t.uuid "bybit_item_id", null: false
+    t.string "name"
+    t.string "account_type"
+    t.string "currency"
+    t.decimal "current_balance", precision: 19, scale: 4
+    t.jsonb "institution_metadata"
+    t.jsonb "raw_payload"
+    t.jsonb "raw_transactions_payload"
+    t.jsonb "extra", default: {}, null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["account_type"], name: "index_bybit_accounts_on_account_type"
+    t.index ["bybit_item_id", "account_type"], name: "index_bybit_accounts_on_item_and_type", unique: true
+    t.index ["bybit_item_id"], name: "index_bybit_accounts_on_bybit_item_id"
+  end
+
+  create_table "bybit_items", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
+    t.uuid "family_id", null: false
+    t.string "name"
+    t.string "institution_name"
+    t.string "institution_domain"
+    t.string "institution_url"
+    t.string "institution_color"
+    t.string "status", default: "good"
+    t.boolean "scheduled_for_deletion", default: false
+    t.boolean "pending_account_setup", default: false
+    t.datetime "sync_start_date"
+    t.jsonb "raw_payload"
+    t.text "api_key"
+    t.text "api_secret"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["family_id"], name: "index_bybit_items_on_family_id"
+    t.index ["status"], name: "index_bybit_items_on_status"
   end
 
   create_table "categories", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
@@ -2059,6 +2096,8 @@ ActiveRecord::Schema[7.2].define(version: 2026_05_31_213000) do
   add_foreign_key "balances", "accounts", on_delete: :cascade
   add_foreign_key "binance_accounts", "binance_items"
   add_foreign_key "binance_items", "families"
+  add_foreign_key "bybit_accounts", "bybit_items"
+  add_foreign_key "bybit_items", "families"
   add_foreign_key "brex_accounts", "brex_items"
   add_foreign_key "brex_items", "families"
   add_foreign_key "budget_categories", "budgets"

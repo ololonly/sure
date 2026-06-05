@@ -1,0 +1,305 @@
+# frozen_string_literal: true
+
+class BybitItemsController < ApplicationController
+  before_action :set_bybit_item, only: [ :show, :edit, :update, :destroy, :sync, :setup_accounts, :complete_account_setup ]
+  before_action :require_admin!, only: [ :new, :create, :select_accounts, :link_accounts, :select_existing_account, :link_existing_account, :edit, :update, :destroy, :sync, :setup_accounts, :complete_account_setup ]
+
+  def index
+    @bybit_items = Current.family.bybit_items.ordered
+  end
+
+  def show
+  end
+
+  def new
+    @bybit_item = Current.family.bybit_items.build
+  end
+
+  def edit
+  end
+
+  def create
+    @bybit_item = Current.family.bybit_items.build(bybit_item_params)
+    @bybit_item.name ||= t(".default_name")
+
+    if @bybit_item.save
+      @bybit_item.set_bybit_institution_defaults!
+      @bybit_item.sync_later
+
+      if turbo_frame_request?
+        flash.now[:notice] = t(".success")
+        @bybit_items = Current.family.bybit_items.ordered
+        render turbo_stream: [
+          turbo_stream.update(
+            "bybit-providers-panel",
+            partial: "settings/providers/bybit_panel",
+            locals: { bybit_items: @bybit_items }
+          ),
+          *flash_notification_stream_items
+        ]
+      else
+        redirect_to settings_providers_path, notice: t(".success"), status: :see_other
+      end
+    else
+      @error_message = @bybit_item.errors.full_messages.join(", ")
+
+      if turbo_frame_request?
+        render turbo_stream: turbo_stream.replace(
+          "bybit-providers-panel",
+          partial: "settings/providers/bybit_panel",
+          locals: { error_message: @error_message }
+        ), status: :unprocessable_entity
+      else
+        redirect_to settings_providers_path, alert: @error_message, status: :see_other
+      end
+    end
+  end
+
+  def update
+    if @bybit_item.update(bybit_item_params)
+      if turbo_frame_request?
+        flash.now[:notice] = t(".success")
+        @bybit_items = Current.family.bybit_items.ordered
+        render turbo_stream: [
+          turbo_stream.update(
+            "bybit-providers-panel",
+            partial: "settings/providers/bybit_panel",
+            locals: { bybit_items: @bybit_items }
+          ),
+          *flash_notification_stream_items
+        ]
+      else
+        redirect_to settings_providers_path, notice: t(".success"), status: :see_other
+      end
+    else
+      @error_message = @bybit_item.errors.full_messages.join(", ")
+
+      if turbo_frame_request?
+        render turbo_stream: turbo_stream.replace(
+          "bybit-providers-panel",
+          partial: "settings/providers/bybit_panel",
+          locals: { error_message: @error_message }
+        ), status: :unprocessable_entity
+      else
+        redirect_to settings_providers_path, alert: @error_message, status: :see_other
+      end
+    end
+  end
+
+  def destroy
+    @bybit_item.destroy_later
+    redirect_to settings_providers_path, notice: t(".success")
+  end
+
+  def sync
+    unless @bybit_item.syncing?
+      @bybit_item.sync_later
+    end
+
+    respond_to do |format|
+      format.html { redirect_back_or_to accounts_path }
+      format.json { head :ok }
+    end
+  end
+
+  def select_accounts
+    redirect_to settings_providers_path
+  end
+
+  def link_accounts
+    redirect_to settings_providers_path
+  end
+
+  def select_existing_account
+    @account = Current.family.accounts.find(params[:account_id])
+
+    @available_bybit_accounts = Current.family.bybit_items
+      .includes(bybit_accounts: [ :account, { account_provider: :account } ])
+      .flat_map(&:bybit_accounts)
+      .select { |ba| ba.account.present? || ba.account_provider.nil? }
+      .sort_by { |ba| ba.updated_at || ba.created_at }
+      .reverse
+
+    render :select_existing_account, layout: false
+  end
+
+  def link_existing_account
+    @account = Current.family.accounts.find(params[:account_id])
+
+    bybit_account = BybitAccount
+      .joins(:bybit_item)
+      .where(id: params[:bybit_account_id], bybit_items: { family_id: Current.family.id })
+      .first
+
+    unless bybit_account
+      alert_msg = t(".errors.invalid_bybit_account")
+      if turbo_frame_request?
+        flash.now[:alert] = alert_msg
+        render turbo_stream: Array(flash_notification_stream_items)
+      else
+        redirect_to account_path(@account), alert: alert_msg
+      end
+      return
+    end
+
+    if @account.account_providers.any? || @account.plaid_account_id.present? || @account.simplefin_account_id.present?
+      alert_msg = t(".errors.only_manual")
+      if turbo_frame_request?
+        flash.now[:alert] = alert_msg
+        return render turbo_stream: Array(flash_notification_stream_items)
+      else
+        return redirect_to account_path(@account), alert: alert_msg
+      end
+    end
+
+    unless @account.crypto?
+      alert_msg = t(".errors.only_manual")
+      if turbo_frame_request?
+        flash.now[:alert] = alert_msg
+        return render turbo_stream: Array(flash_notification_stream_items)
+      else
+        return redirect_to account_path(@account), alert: alert_msg
+      end
+    end
+
+    Account.transaction do
+      bybit_account.lock!
+      ap = AccountProvider.find_or_initialize_by(provider: bybit_account)
+      previous_account = ap.account
+      ap.account_id = @account.id
+      ap.save!
+
+      if previous_account && previous_account.id != @account.id && previous_account.family_id == @account.family_id
+        Rails.logger.info("Bybit: re-linked BybitAccount #{bybit_account.id} from account ##{previous_account.id} to ##{@account.id}")
+      end
+    end
+
+    if turbo_frame_request?
+      item = bybit_account.bybit_item.reload
+      @bybit_items = Current.family.bybit_items.ordered.includes(:syncs)
+      @manual_accounts = Account.uncached { Current.family.accounts.visible_manual.order(:name).to_a }
+
+      flash.now[:notice] = t(".success")
+      @account.reload
+      manual_accounts_stream = if @manual_accounts.any?
+        turbo_stream.update("manual-accounts", partial: "accounts/index/manual_accounts", locals: { accounts: @manual_accounts })
+      else
+        turbo_stream.replace("manual-accounts", view_context.tag.div(id: "manual-accounts"))
+      end
+
+      render turbo_stream: [
+        turbo_stream.replace(
+          ActionView::RecordIdentifier.dom_id(item),
+          partial: "bybit_items/bybit_item",
+          locals: { bybit_item: item }
+        ),
+        manual_accounts_stream,
+        *Array(flash_notification_stream_items)
+      ]
+    else
+      redirect_to accounts_path, notice: t(".success")
+    end
+  end
+
+  def setup_accounts
+    @bybit_accounts = @bybit_item.bybit_accounts
+      .left_joins(:account_provider)
+      .where(account_providers: { id: nil })
+      .order(:name)
+  end
+
+  def complete_account_setup
+    setup_params = complete_account_setup_params
+
+    if setup_params[:sync_start_date].present?
+      parsed_date = begin
+        Date.parse(setup_params[:sync_start_date].to_s)
+      rescue ArgumentError
+        nil
+      end
+
+      if parsed_date.present? && parsed_date <= Date.current
+        @bybit_item.update!(sync_start_date: parsed_date)
+      else
+        flash.now[:alert] = "Sync start date must be a valid date in the past."
+      end
+    end
+
+    selected_accounts = Array(setup_params[:selected_accounts]).reject(&:blank?)
+    created_accounts = []
+
+    selected_accounts.each do |bybit_account_id|
+      ba = @bybit_item.bybit_accounts.find_by(id: bybit_account_id)
+      next unless ba
+
+      begin
+        ba.with_lock do
+          next if ba.account.present?
+
+          account = Account.create_from_bybit_account(ba)
+          provider_link = ba.ensure_account_provider!(account)
+
+          if provider_link
+            created_accounts << account
+          else
+            account.destroy!
+          end
+        end
+      rescue StandardError => e
+        Rails.logger.error("Failed to setup account for BybitAccount #{ba.id}: #{e.message}")
+        next
+      end
+
+      ba.reload
+
+      begin
+        BybitAccount::HoldingsProcessor.new(ba).process
+      rescue StandardError => e
+        Rails.logger.error("Failed to process holdings for #{ba.id}: #{e.message}")
+      end
+    end
+
+    unlinked_remaining = @bybit_item.bybit_accounts
+      .left_joins(:account_provider)
+      .where(account_providers: { id: nil })
+      .count
+    @bybit_item.update!(pending_account_setup: unlinked_remaining > 0)
+
+    if created_accounts.any?
+      flash.now[:notice] = t(".success", count: created_accounts.count)
+    elsif selected_accounts.empty?
+      flash.now[:notice] = t(".none_selected")
+    else
+      flash.now[:notice] = t(".no_accounts")
+    end
+
+    @bybit_item.sync_later if created_accounts.any?
+
+    if turbo_frame_request?
+      @bybit_items = Current.family.bybit_items.ordered.includes(:syncs)
+      render turbo_stream: [
+        turbo_stream.replace(
+          ActionView::RecordIdentifier.dom_id(@bybit_item),
+          partial: "bybit_items/bybit_item",
+          locals: { bybit_item: @bybit_item }
+        )
+      ] + Array(flash_notification_stream_items)
+    else
+      redirect_to accounts_path, status: :see_other
+    end
+  end
+
+  private
+
+    def set_bybit_item
+      @bybit_item = Current.family.bybit_items.find(params[:id])
+    end
+
+    def bybit_item_params
+      params.require(:bybit_item).permit(:name, :sync_start_date, :api_key, :api_secret)
+    end
+
+    def complete_account_setup_params
+      params.permit(:sync_start_date, selected_accounts: [])
+    end
+end
